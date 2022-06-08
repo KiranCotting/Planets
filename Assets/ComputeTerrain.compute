@@ -1,0 +1,229 @@
+﻿#pragma kernel ComputeTerrain
+
+struct Crater {
+	float radius;
+	float3 position;
+};
+
+struct NoiseSettings {
+    uint layers;
+    float scale;
+    float elevation;
+    float verticalShift;
+    float lacunarity;
+    float gain;
+    float3 offset;
+};
+
+StructuredBuffer<float3> vertices;
+StructuredBuffer<NoiseSettings> noiseSettings;
+StructuredBuffer<Crater> craters;
+
+// crater settings
+uint numCraters;
+float rimSteepness;
+float rimWidth;
+float floorHeight;
+float craterSmoothness;
+
+// ocean settings
+float oceanFloor;
+
+// color settings
+float4 color1;
+float4 color2;
+float blendWidth;
+float blendHeight;
+
+RWStructuredBuffer<float> heights;
+RWStructuredBuffer<float4> colorData;
+
+// snoise function and associated functions taken from:
+// Description : Array and textureless GLSL 2D/3D/4D simplex
+//               noise functions.
+//      Author : Ian McEwan, Ashima Arts.
+//  Maintainer : ijm
+//     Lastmod : 20110822 (ijm)
+//     License : Copyright (C) 2011 Ashima Arts. All rights reserved.
+//               Distributed under the MIT License. See LICENSE file.
+//               https://github.com/ashima/webgl-noise
+//
+float3 mod289(float3 x)
+{
+    return x - floor(x * (1.0 / 289.0)) * 289.0;
+}
+
+float4 mod289(float4 x) {
+    return x - floor(x * (1.0 / 289.0)) * 289.0;
+}
+
+float4 permute(float4 x)
+{
+    return mod289((x * 34.0 + 1.0) * x);
+}
+
+float4 taylorInvSqrt(float4 r)
+{
+    return 1.79284291400159 - 0.85373472095314 * r;
+}
+
+float snoise(float3 v)
+{
+    const float2 C = float2(1.0 / 6.0, 1.0 / 3.0);
+
+    // First corner
+    float3 i = floor(v + dot(v, C.yyy));
+    float3 x0 = v - i + dot(i, C.xxx);
+
+    // Other corners
+    float3 g = step(x0.yzx, x0.xyz);
+    float3 l = 1.0 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+
+    // x1 = x0 - i1  + 1.0 * C.xxx;
+    // x2 = x0 - i2  + 2.0 * C.xxx;
+    // x3 = x0 - 1.0 + 3.0 * C.xxx;
+    float3 x1 = x0 - i1 + C.xxx;
+    float3 x2 = x0 - i2 + C.yyy;
+    float3 x3 = x0 - 0.5;
+
+    // Permutations
+    i = mod289(i); // Avoid truncation effects in permutation
+    float4 p =
+        permute(permute(permute(i.z + float4(0.0, i1.z, i2.z, 1.0))
+            + i.y + float4(0.0, i1.y, i2.y, 1.0))
+            + i.x + float4(0.0, i1.x, i2.x, 1.0));
+
+    // Gradients: 7x7 points over a square, mapped onto an octahedron.
+    // The ring size 17*17 = 289 is close to a multiple of 49 (49*6 = 294)
+    float4 j = p - 49.0 * floor(p * (1.0 / 49.0));  // mod(p,7*7)
+
+    float4 x_ = floor(j * (1.0 / 7.0));
+    float4 y_ = floor(j - 7.0 * x_);  // mod(j,N)
+
+    float4 x = x_ * (2.0 / 7.0) + 0.5 / 7.0 - 1.0;
+    float4 y = y_ * (2.0 / 7.0) + 0.5 / 7.0 - 1.0;
+
+    float4 h = 1.0 - abs(x) - abs(y);
+
+    float4 b0 = float4(x.xy, y.xy);
+    float4 b1 = float4(x.zw, y.zw);
+
+    //vec4 s0 = vec4(lessThan(b0, 0.0)) * 2.0 - 1.0;
+    //vec4 s1 = vec4(lessThan(b1, 0.0)) * 2.0 - 1.0;
+    float4 s0 = floor(b0) * 2.0 + 1.0;
+    float4 s1 = floor(b1) * 2.0 + 1.0;
+    float4 sh = -step(h, float4(0.0, 0.0, 0.0, 0.0));
+
+    float4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    float4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+    float3 g0 = float3(a0.xy, h.x);
+    float3 g1 = float3(a0.zw, h.y);
+    float3 g2 = float3(a1.xy, h.z);
+    float3 g3 = float3(a1.zw, h.w);
+
+    // Normalise gradients
+    float4 norm = taylorInvSqrt(float4(dot(g0, g0), dot(g1, g1), dot(g2, g2), dot(g3, g3)));
+    g0 *= norm.x;
+    g1 *= norm.y;
+    g2 *= norm.z;
+    g3 *= norm.w;
+
+    // Mix final noise value
+    float4 m = max(0.6 - float4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+    m = m * m;
+    m = m * m;
+
+    float4 px = float4(dot(x0, g0), dot(x1, g1), dot(x2, g2), dot(x3, g3));
+    return 42.0 * dot(m, px);
+}
+
+float smoothMin(float a, float b, float k) {
+	float h = clamp((b - a + k) / (2 * k), 0.0, 1.0);
+	return a * h + b * (1 - h) - k * h * (1 - h);
+}
+
+float smoothMax(float a, float b, float k) {
+	return smoothMin(a, b, -k);
+}
+
+float layeredNoise(float3 vec, uint layers, float lacunarity, float gain) {
+    float noiseSum = 0;
+    float amplitude = 1;
+    float frequency = 1;
+
+    for (uint i = 0; i < layers; i++) {
+        noiseSum += snoise(vec * frequency) * amplitude;
+        frequency *= lacunarity;
+        amplitude *= gain;
+    }
+    return noiseSum;
+}
+
+float ridgeNoise(float3 vec, uint layers, float lacunarity, float gain) {
+    float noiseSum = 0;
+    float amplitude = 1;
+    float frequency = 1;
+
+    for (uint i = 0; i < layers; i++) {
+        noiseSum += abs(snoise(vec * frequency) * amplitude);
+        frequency *= lacunarity;
+        amplitude *= gain;
+    }
+    return pow(1.0 - noiseSum, 2.0);
+}
+
+[numthreads(256, 1, 1)]
+void ComputeTerrain(uint id : SV_DispatchThreadID)
+{
+	float3 vertexPos = vertices[id];
+    heights[id] = 1;
+
+    float noise[3];
+
+    // shape, detail, and color noise 
+    for (uint i = 0; i < 3; i++) {
+        NoiseSettings n = noiseSettings[i];
+        float3 noiseVec = (vertices[id] + n.offset) * n.scale;
+        noise[i] = layeredNoise(noiseVec, n.layers, n.lacunarity, n.gain) * n.elevation + n.verticalShift;
+    }
+
+    // shape
+    heights[id] += noise[0];
+
+    // detail
+    heights[id] += noise[1];
+
+    // color
+    colorData[id] = lerp(color1, color2, clamp((noise[2] - blendHeight) / blendWidth, 0, 1));
+
+    // ocean
+    NoiseSettings n = noiseSettings[4];
+    float3 noiseVec = (vertices[id] + n.offset) * n.scale;
+    float oceanHeight = layeredNoise(noiseVec, n.layers, n.lacunarity, n.gain) * n.elevation + n.verticalShift;
+    oceanHeight = smoothMin(oceanFloor, smoothMax(0.0, oceanHeight, 0.01), 0.01);
+    heights[id] -= oceanHeight;
+
+    // ridge
+    n = noiseSettings[3];
+    noiseVec = (vertices[id] + n.offset) * n.scale;
+    float ridgeHeight = ridgeNoise(noiseVec, n.layers, n.lacunarity, n.gain) * n.elevation + n.verticalShift;
+    heights[id] += smoothMax(0.0, ridgeHeight, 0.01);
+
+	float craterHeight = 0;
+
+	for (uint j = 0; j < numCraters; j++) {
+		float x = length(vertexPos - craters[j].position) / craters[j].radius;
+		float cavity = x * x - 1;
+		float rimX = min(x - 1 - rimWidth, 0);
+		float rim = rimSteepness * rimX * rimX;
+
+		float craterShape = smoothMax(cavity, floorHeight, craterSmoothness);
+		craterShape = smoothMin(craterShape, rim, craterSmoothness);
+		craterHeight += craterShape * craters[j].radius;
+	}
+
+	heights[id] += craterHeight;
+}
